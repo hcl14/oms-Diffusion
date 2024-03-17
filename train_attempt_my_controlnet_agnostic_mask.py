@@ -29,7 +29,7 @@ else:
 from viton_dataset import get_opt, VITONDataset, VITONDataLoader
 
 from diffusers import UniPCMultistepScheduler, AutoencoderKL
-from diffusers.pipelines import StableDiffusionPipeline
+from diffusers.pipelines import StableDiffusionPipeline, StableDiffusionControlNetPipeline
 
 import bitsandbytes as bnb
 
@@ -61,6 +61,35 @@ def save_img(tensr, name):
     tensr = tensr * 0.5 + 0.5
     torchvision.utils.save_image(tensr[0, :, :, :],name)
 
+# taken from DDIM scheduler
+def scheduler_get_noise(
+        scheduler,
+        original_samples: torch.FloatTensor,
+        noise: torch.FloatTensor,
+        timesteps: torch.IntTensor,
+    ) -> torch.FloatTensor:
+        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
+        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
+        # for the subsequent add_noise calls
+        alphas_cumprod = scheduler.alphas_cumprod.to(device=original_samples.device)
+        #alphas_cumprod = alphas_cumprod.to(dtype=original_samples.dtype)
+        timesteps = timesteps.to(original_samples.device)
+
+        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+
+        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+
+        #noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+        #return noisy_samples
+        return sqrt_alpha_prod, sqrt_one_minus_alpha_prod
+
+
 def collate_fn(data):
     images = torch.stack([example["img"] for example in data])
     #text_input_ids = torch.cat([example["text_input_ids"] for example in data], dim=0)
@@ -83,6 +112,9 @@ def collate_fn(data):
     }
     
 
+
+control_net_openpose = ControlNetModel.from_single_file("/workspace/ControlNet-v1-1/control_v11p_sd15_openpose.pth", torch_dtype=torch.float32)
+
 class ClothAdapter(torch.nn.Module):
     """Cloth-Adapter"""
     def __init__(self, unet, ref_path=None, weight_dtype=torch.float32):
@@ -99,7 +131,7 @@ class ClothAdapter(torch.nn.Module):
 
         torch.save(self.unet.state_dict(), 'infer_unet.pt')
 
-        self.controlnet = ControlNetModel.from_single_file("/workspace/ControlNet-v1-1/control_v11p_sd15_openpose.pth",      torch_dtype=torch.float32)
+        self.controlnet = control_net_openpose
 
         # freeze controlnet
         # freeze unet
@@ -112,10 +144,12 @@ class ClothAdapter(torch.nn.Module):
         # load weights if they exist
         state_dict = {}
         if os.path.exists(self.ref_path):
+            '''
             with safe_open(self.ref_path, framework="pt", device="cpu") as f:
                 for key in garment_keys:
                     state_dict[key] = f.get_tensor(key)
-            ref_unet.load_state_dict(state_dict, strict=False)
+            '''
+            ref_unet.load_state_dict(torch.load(self.ref_path), strict=False)
             print("Cloth adapter unet loaded from checkpoint")
 
 
@@ -208,6 +242,7 @@ class ClothAdapter(torch.nn.Module):
             weight_dtype,
             cloth_image='data/zalando/train/cloth/14114_00.jpg',
             cloth_mask_image='data/zalando/train/cloth-mask/14114_00.jpg',
+            openpose_image='data/zalando/train/openpose_img/14114_00_rendered.png',
             prompt=None,
             a_prompt="best quality, high quality",
             num_images_per_prompt=1,
@@ -254,9 +289,9 @@ class ClothAdapter(torch.nn.Module):
 
             # we have something wrong with original unet after training
             unet = pipe.unet
-            pipe.unet = copy.deepcopy(pipe.unet)
+            #pipe.unet = copy.deepcopy(pipe.unet)
 
-            pipe.unet.load_state_dict(torch.load('infer_unet.pt'), strict=False)
+            #pipe.unet.load_state_dict(torch.load('infer_unet.pt'), strict=False)
 
 
             pipe.unet.to('cuda', dtype=torch.float32)
@@ -264,8 +299,11 @@ class ClothAdapter(torch.nn.Module):
 
             self.set_adapter(pipe.unet, "write")
 
+            img = Image.open(openpose_image)
+
             generator = torch.Generator(self.device).manual_seed(seed) if seed is not None else None
             images = pipe(
+                image=img,
                 prompt_embeds=prompt_embeds.to(dtype=torch.float32),
                 negative_prompt_embeds=negative_prompt_embeds.to(dtype=torch.float32),
                 guidance_scale=guidance_scale,
@@ -277,7 +315,7 @@ class ClothAdapter(torch.nn.Module):
                 **kwargs,
             ).images
 
-            del(pipe.unet)
+            #del(pipe.unet)
             pipe.vae.to(dtype=weight_dtype)
             pipe.unet = unet
 
@@ -398,7 +436,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="fp16",# None,
+        default="no",# None,
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -446,15 +484,19 @@ def main():
 
     #pipe = StableDiffusionPipeline.from_single_file('realisticVisionV60B1_v60B1VAE.safetensors', torch_dtype=torch.float32)
 
-    pipe = StableDiffusionPipeline.from_pretrained("SG161222/Realistic_Vision_V4.0_noVAE", cache_dir='cache')
-    pipe.vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", cache_dir='cache')
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", cache_dir='cache')
 
-    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    #pipe = StableDiffusionPipeline.from_pretrained("SG161222/Realistic_Vision_V4.0_noVAE", cache_dir='cache')
+    pipe = StableDiffusionControlNetPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", vae=vae, controlnet=control_net_openpose, cache_dir='cache')
+
+
+    #pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
     pipe.to('cuda')
 
     #noise_scheduler = pipe.scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained("SG161222/Realistic_Vision_V4.0_noVAE", subfolder="scheduler", cache_dir='cache')#pipe.scheduler
+    noise_scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler",cache_dir='cache')
+    #noise_scheduler = DDPMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler", cache_dir='cache')#pipe.scheduler
 
     tokenizer = pipe.tokenizer
 
@@ -495,7 +537,7 @@ def main():
 
     # Freeze everything except the f keys()
     
-    cloth_adapter = ClothAdapter(unet, 'weights.pt')
+    cloth_adapter = ClothAdapter(unet, 'weights_1000.pt')
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -519,9 +561,9 @@ def main():
 
     params_to_opt = itertools.chain(p_to_opt)
     print(f'lr: {args.learning_rate}, weight_decay: {args.weight_decay}')
-    #optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
     #optimizer = bnb.optim.Adam(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.995), optim_bits=8, percentile_clipping=5)
-    optimizer = bnb.optim.AdamW8bit(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
+    #optimizer = bnb.optim.AdamW8bit(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # dataloader
     # train_dataset = MyDataset(args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path)
@@ -588,7 +630,9 @@ def main():
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                noisy_latents = latents*(1-agnostic_mask) + noisy_latents*agnostic_mask
+                sqrt_alpha_prod, sqrt_one_minus_alpha_prod = scheduler_get_noise(noise_scheduler, latents, noise, timesteps)
+
+                #noisy_latents = latents*(1-agnostic_mask) + noise*agnostic_mask
 
 
                 with torch.no_grad():
@@ -666,14 +710,31 @@ def main():
                     images = cloth_adapter.generate(pipe, weight_dtype)
                     images[0].save(f"train_{step}.jpg")
 
+                    images = cloth_adapter.generate(pipe, weight_dtype,
+                                                    cloth_image='data/zalando/train/cloth/14563_00.jpg',
+                                                    cloth_mask_image='data/zalando/train/cloth-mask/14563_00.jpg',
+                                                    openpose_image='data/zalando/train/openpose_img/14563_00_rendered.png')
+                    images[0].save(f"train_2_{step}.jpg")
+
+                    images = cloth_adapter.generate(pipe, weight_dtype,
+                                                    cloth_image='data/zalando/train/cloth/13682_00.jpg',
+                                                    cloth_mask_image='data/zalando/train/cloth-mask/13682_00.jpg',
+                                                    openpose_image='data/zalando/train/openpose_img/13682_00_rendered.png')
+                    images[0].save(f"train_3_{step}.jpg")
+
+
                     img_train = batch["img"]
                     img_train = (img_train / 2 + 0.5).clamp(0, 1)
                     img_train = (img_train.cpu().permute(0, 2, 3, 1).float().numpy()*255).astype(np.uint8)[0]
 
                     Image.fromarray(img_train).save('train.png')
 
-                    # check output
-                    latents = noisy_latents + noise_pred
+                    # check output - restore amount of noise, added by scheduler
+                    #latents = noisy_latents + noise_pred
+                    #noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
+
+                    latents = (noisy_latents - sqrt_one_minus_alpha_prod * noise_pred)/(sqrt_alpha_prod + 0.001)
+
                     image_pred = (decode_latents(vae, latents.to(dtype=weight_dtype))*255).astype(np.uint8)[0]
                     Image.fromarray(image_pred, mode='RGB').save('prediction.jpg')
 
