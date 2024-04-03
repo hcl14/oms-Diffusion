@@ -164,6 +164,8 @@ class AlignedDatasetHDF5(BaseDataset):
         self.C_paths = []
         self.C_types = []
         for line in lines:
+            if not line:
+                continue
             p_name, c_name, c_type = line.strip().split()
             p_name = p_name.replace('.png', '.jpg')
             # P_path = os.path.join(self.root, c_type, 'image', p_name)
@@ -182,12 +184,11 @@ class AlignedDatasetHDF5(BaseDataset):
         ratio_dict = None
         if self.mode == 'train':
             ratio_dict = {}
-            # person_clothes_ratio_txt = os.path.join(self.root, '/workspace/DressCode_train/DressCode_1024/person_clothes_ratio_upper_train.txt')
-            # with open(person_clothes_ratio_txt, 'r') as f:
-            #     lines = f.readlines()
             kk = np.array(hf['annots']['ratio'])
             lines = io.BytesIO(kk).read().decode('UTF-8').split('\n')
             for line in lines:
+                if not line:
+                    continue
                 c_name, ratio = line.strip().split()
                 ratio = float(ratio)
                 ratio_dict[c_name] = ratio
